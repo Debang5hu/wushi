@@ -1,145 +1,193 @@
 #!/usr/bin/python3
 
-# _*_ coding:utf-8_*_
+# _*_ coding: utf-8 _*_
 
 import paramiko
 import logging
 import os
-import sys
 import socket
-from paramiko import SSHException
+import pty
+import subprocess
+import threading
+import sys
+from paramiko import RSAKey
 
-# logging setup
-log_dir = 'Logs'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
+# Log configuration
+LOG_DIR = 'Logs'
+os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
-    filename=os.path.join(log_dir, 'ssh.log'),
+    filename=os.path.join(LOG_DIR, 'ssh.log'),
     level=logging.INFO,
-    format='%(asctime)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# HoneySSH class
+# RSA key config
+SERVER_KEY_PATH = 'certificate/rsa_key.pem'
+os.makedirs(os.path.dirname(SERVER_KEY_PATH), exist_ok=True)
+
+if not os.path.exists(SERVER_KEY_PATH):
+    logging.info("Generating persistent RSA key...")
+    RSAKey.generate(2048).write_private_key_file(SERVER_KEY_PATH)
+
+
+# fakessh
 class HoneySSH(paramiko.ServerInterface):
     def __init__(self):
         self.authenticated = False
         self.channel = None
+        self.exit_flag = False  # flag to indicate exit
 
     def check_auth_password(self, username, password):
-        if username == 'ryuk' and password == 'ryuk':  # hardcoded
+        if username == 'ryuk' and password == 'ryuk':
             self.authenticated = True
-            logging.info(f"Successful login attempt from {username}")
+            logging.info(f"Successful login attempt with username: {username}")
             return paramiko.AUTH_SUCCESSFUL
         else:
-            logging.warning(f"[+] Failed login attempt with username: {username} and password: {password}")
+            logging.warning(f"Failed login attempt with username: {username} and password: {password}")
             return paramiko.AUTH_FAILED
+
 
     def check_channel_request(self, kind, chanid):
         if kind == 'session':
+            logging.info(f"Session channel requested, chanid={chanid}")
             return paramiko.OPEN_SUCCEEDED
+        logging.warning(f"Non-session channel request received: kind={kind}")
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
-    def check_exec_request(self, command):
-        if self.authenticated:
-            logging.info(f"Command executed by attacker: {command}")
-            if self.channel:
-                self.channel.sendall(f"Executing command: {command}\n")
-            return paramiko.CHANNEL_REQUEST_REPLY
-        else:
-            return paramiko.CHANNEL_REQUEST_FAILURE
+
+    def check_channel_pty_request(self, *args, **kwargs):
+        logging.info(f"PTY request received with parameters: args={args}, kwargs={kwargs}")
+        return True
+
+
+    def check_channel_shell_request(self, chan):
+        logging.info("Shell request received.")
+        return True
 
 
     def get_shell(self):
-        if self.channel is None:
-            logging.error("Channel is not available.")
+        if not self.channel or self.channel.closed:
+            logging.error("Channel is not available or closed for shell access.")
             return
 
         try:
-            if not self.channel.active:
-                logging.error("Channel is not active, cannot allocate PTY.")
-                return
+            logging.info("Starting jailed shell interaction...")
 
-            self.channel.get_pty(term='xterm', width=80, height=24)
+            # fork a pseudo-terminal to run /bin/bash
+            pid, fd = pty.fork()
+            
+            # child process
+            if pid == 0:
+                os.setgid(1001)  # GID
+                os.setuid(1001)  # UID
+                os.environ["PS1"] = "ryuk@honeypot:~$ "  # prompt
+                
+                # log commands in bash
+                #os.environ["PROMPT_COMMAND"] = 'echo "$(date) - $(whoami) - $(pwd) - $(history 1)" >> .bash.log'
+                
+                os.execv('/bin/bash', ['/bin/bash', '--noprofile', '--norc'])  # jail shell
+            
+            else:  
+                self.channel.setblocking(True)
+
+                # Banner
+                self.channel.send("\033c")  # clear
+                self.channel.send("ryuk@honeypot:~$ ")
+
+                # Threading
+                read_thread = threading.Thread(target=self.read_from_shell, args=(fd,))
+                write_thread = threading.Thread(target=self.write_to_shell, args=(fd,))
+                read_thread.start()
+                write_thread.start()
+
+                read_thread.join()
+                write_thread.join()
+
         except Exception as e:
-            logging.error(f"Failed to allocate PTY: {e}")
-            return
+            logging.error(f"Failed to handle jailed shell interaction: {e}")
+        
+        finally:
+            if self.channel and not self.channel.closed:
+                self.channel.close()
+                logging.info("Channel closed after jailed shell interaction.")
 
 
-        self.channel.sendall("Welcome to the honeyssh.          -d\n")
-        self.channel.sendall("Type 'exit' to disconnect.\n")
+    def read_from_shell(self, fd):
+        while not self.exit_flag:
+            try:
+                data = os.read(fd, 1024)
+                if data:
+                    self.channel.send(data)
 
-        while True:
-            if not self.channel.active:
-                logging.warning("Channel is no longer active.")
+                    if data.strip() == b'exit':
+                        logging.info("Exit command received. Shutting down SSH honeypot...")
+                        self.channel.send("Goodbye!\n")
+                        self.exit_flag = True
+                else:
+                    break
+            except OSError:
                 break
 
-        self.channel.sendall("ryuk@localhost: ")
-        command = self.channel.recv(1024).decode().strip()
 
-        if command.lower() == 'exit':
-            self.channel.sendall("Goodbye!\n")
-            break
-        elif command:
-            logging.info(f"Command issued: {command}")
-            self.channel.sendall(f"Command '{command}' is not allowed.\n")
-
-        self.channel.sendall(f"Jail shell: Command '{command}' not executed.\n")
-
-
-    def get_transport(self):
-        return self.channel
+    def write_to_shell(self, fd):
+        while not self.exit_flag:
+            try:
+                data = self.channel.recv(1024)
+                if not data:
+                    break
+                os.write(fd, data)
+            except Exception as e:
+                logging.error(f"Error in SSH shell communication: {e}")
+                break
 
 
 def runSSH():
     try:
-        # create an SSH server
         listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_socket.bind(('0.0.0.0', 22))
-        listen_socket.listen(100)
+        listen_socket.listen()
 
         logging.info("[+] SSH honeypot started and listening on port 22...")
 
         while True:
-            client_socket, addr = listen_socket.accept()
-            logging.info(f"Connection received from {addr}")
-
             try:
+                client_socket, addr = listen_socket.accept()
+                logging.info(f"Connection received from {addr}")
+
                 transport = paramiko.Transport(client_socket)
-                transport.load_server_moduli()
-                transport.add_server_key(paramiko.RSAKey.generate(2048))  # Consider persistent server key
+                transport.add_server_key(RSAKey(filename=SERVER_KEY_PATH))
 
                 honey_ssh = HoneySSH()
-
-                # start the SSH server with the HoneySSH instance
                 transport.start_server(server=honey_ssh)
 
-                # Accept the channel with a timeout of 20 seconds
-                channel = transport.accept(20)
+                channel = transport.accept(60)
                 if channel is None:
-                    logging.error("No channel received from client within the timeout period.")
+                    logging.warning(f"No channel received from {addr} within timeout.")
                     client_socket.close()
                     continue
 
-                # Execute shell
                 honey_ssh.channel = channel
                 honey_ssh.get_shell()
 
-                # Close connection
-                client_socket.close()
+            except paramiko.SSHException as e:
+                logging.error(f"SSH error: {e}")
             
-            except SSHException as e:
-                logging.error(f"Error during SSH connection: {e}")
-                client_socket.close()
             except Exception as e:
-                logging.error(f"Unexpected error during SSH connection: {e}")
-                client_socket.close()
+                logging.error(f"Unexpected error: {e}")
 
+    except KeyboardInterrupt:
+        logging.info("Shutting down SSH honeypot...")
+    
     except Exception as e:
-        logging.error(f"Error starting SSH server: {e}")
-        sys.exit(1)
+        logging.error(f"Critical error starting SSH server: {e}")
+
+    finally:
+        listen_socket.close()
+        logging.info("Socket closed. Exiting.")
 
 
 if __name__ == "__main__":
+    print('[+] SSH Server Started...')
     runSSH()
