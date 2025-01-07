@@ -3,10 +3,12 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 )
 
 //  <--- GLOBAL VALUES   --->
@@ -21,77 +23,86 @@ const (
 	CYAN    = "\033[36m"
 )
 
-var PORTS = []int{22}
+var LogMonitor *log.Logger
+var stopChan = make(chan struct{})
+
+
+
+// ensure Logs directory exists and create monitor.log
+func init() {
+	if _, err := os.Stat("Logs"); os.IsNotExist(err) {
+		if err := os.Mkdir("Logs", 0755); err != nil {
+			log.Fatalf("%s[!]%s Failed to create Logs directory: %v", RED, WHITE, err)
+		}
+	}
+
+	logFile, err := os.OpenFile("Logs/monitor.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("%s[!]%s Failed to create/open monitor.log: %v", RED, WHITE, err)
+	}
+
+	LogMonitor = log.New(logFile, "[Wushi] ", log.LstdFlags)
+}
+
+
+
+
+// retry logic
+func RunCommandWithRetry(cmd *exec.Cmd, maxRetries int, wg *sync.WaitGroup, name string) {
+	defer wg.Done()
+	retries := 0
+
+	for {
+		select {
+		case <-stopChan:
+			LogMonitor.Printf("[+] Received shutdown signal. Stopping %s...", name)
+			return
+		default:
+			LogMonitor.Printf("[+] Starting %s...", name)
+			if err := cmd.Start(); err != nil {
+				LogMonitor.Printf("[+] ERROR: Failed to start %s: %v", name, err)
+				retries++
+				if retries >= maxRetries {
+					LogMonitor.Printf("[+] ERROR: Maximum retries reached for %s. Exiting...", name)
+					return
+				}
+				time.Sleep(5 * time.Second) // wait before retrying
+				continue
+			}
+
+			LogMonitor.Printf("[+] %s started successfully.", name)
+			if err := cmd.Wait(); err != nil {
+				LogMonitor.Printf("[+] WARNING: %s exited unexpectedly: %v", name, err)
+				retries++
+				if retries >= maxRetries {
+					LogMonitor.Printf("[+] ERROR: Maximum retries reached for %s. Exiting...", name)
+					return
+				}
+				LogMonitor.Printf("[+] Retrying %s...", name)
+			} else {
+				LogMonitor.Printf("[+] %s exited normally.", name)
+				return
+			}
+		}
+	}
+}
+
+
 
 
 // will start flask server
-func HoneyHTTP() {
-	log.Printf("%s[+]%s Starting HTTP honeypot", CYAN, WHITE)
+func HoneyHTTP(wg *sync.WaitGroup) {
 	cmd := exec.Command("python3", "honeyhttp.py")
-	log.Printf("%s[+]%s Honeypot listening on %s443%s\n", CYAN, WHITE, YLW, WHITE)
-
-
-	if _, err := os.Stat("Logs"); os.IsNotExist(err) {
-		os.Mkdir("Logs", 0755)
-	}
-
-	// suppress stdout and log stderr to a file
-	errFile, err := os.Create("Logs/honeyhttp.log")
-	if err != nil {
-		log.Fatalf("%s[!]%s Failed to create log file: %v", RED, WHITE, err)
-	}
-	defer errFile.Close()
-	cmd.Stdout = nil
-	cmd.Stderr = errFile
-
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("%s[!]%s Failed to start HTTPS server: %v", RED, WHITE, err)
-	}
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			log.Printf("%s[!]%s HTTPS server exited: %v", RED, WHITE, err)
-		}
-	}()
+	RunCommandWithRetry(cmd, 3, wg, "HTTP honeypot")
 }
 
 
-
-// processes incoming connections based on port
-func HandleConnection(conn net.Conn, port int) {
-	defer conn.Close()
-	clientAddr := conn.RemoteAddr().String()
-	fmt.Printf("\n%s connected on port %d\n", clientAddr, port)
-
-	if port == 22 {
-		HandleSSHConnection(conn)
-	}
+// will start ssh server
+func HoneySSH(wg *sync.WaitGroup) {
+	cmd := exec.Command("python3", "honeyssh.py")
+	RunCommandWithRetry(cmd, 3, wg, "SSH honeypot")
 }
 
-//   <--- to do   --->
-// handles SSH-specific connections (placeholder)
-func HandleSSHConnection(conn net.Conn) {
-	log.Printf("[+] Simulating SSH connection from %s", conn.RemoteAddr().String())
-}
-
-// starts listening on a specific port
-func Honeypot(port int, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		log.Fatalf("[!] Failed to bind to port %d: %v", port, err)
-	}
-	log.Printf("%s[+]%s Honeypot listening on %s%d%s\n", CYAN, WHITE, YLW, port, WHITE)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("[!] Failed to accept connection on port %d: %v", port, err)
-			continue
-		}
-		go HandleConnection(conn, port)
-	}
-}
 
 
 // main
@@ -108,21 +119,28 @@ func main() {
 		log.Fatalf("%s[+]%s Requires sudo privileges\n", RED, WHITE)
 	}
 
+	fmt.Printf("%s[+]%s Starting HTTP honeypot...\n", GRN, WHITE)
+	fmt.Printf("%s[+]%s Starting SSH honeypot...\n", GRN, WHITE)	
+	LogMonitor.Printf("[+] Monitoring started...")
 
-	// Start services
+
+	// graceful shutdown
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
 	var wg sync.WaitGroup
-	wg.Add(len(PORTS) + 1)
+	wg.Add(2)
 
-	// Start HTTP server
+	go HoneyHTTP(&wg)
+	go HoneySSH(&wg)
+
 	go func() {
-		defer wg.Done()
-		HoneyHTTP()
+		<-signalChan
+		LogMonitor.Printf("[+] Received shutdown signal. Exiting...")
+		close(stopChan)
 	}()
 
-	// Start honeypot on each port
-	for _, port := range PORTS {
-		go Honeypot(port, &wg)
-	}
-
 	wg.Wait()
+	LogMonitor.Printf("[+] All honeypots exited!")
+	log.Printf("%s[+]%s All honeypots exited", CYAN, WHITE)
 }

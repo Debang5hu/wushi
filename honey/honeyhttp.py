@@ -3,7 +3,7 @@
 # _*_ coding:utf-8 _*_
 
 # it logs all the requests made to the sserver
-# it will be using default HTTP port 80
+# it will be using default HTTPS port 443
 
 # HTTP honeypot
 # usage: from honeyhttp import runHttp 
