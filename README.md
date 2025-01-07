@@ -5,7 +5,7 @@
 ![wushi](https://github.com/user-attachments/assets/f1a5007b-f0e6-4ffd-9bfc-8f441340ce6f)  
 
 
-[![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)  [![Go](https://img.shields.io/badge/--00ADD8?logo=go&logoColor=ffffff)](https://golang.org/)  ![Static Badge](https://img.shields.io/badge/LICENSE-debang5hu-blue)
+[![made-with-python](https://img.shields.io/badge/Made%20with-Python-1f425f.svg)](https://www.python.org/)  [![Go](https://img.shields.io/badge/--00ADD8?logo=go&logoColor=ffffff)](https://golang.org/)  ![Static Badge](https://img.shields.io/badge/LICENSE-MIT-blue)
 
 A honeypot focus on ssh and https  
  
