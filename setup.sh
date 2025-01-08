@@ -5,7 +5,7 @@
 
 root() {
     if [[ $EUID -ne 0 ]]; then
-        echo "This script must be run as root."
+        echo "[!] This script must be run as root."
         exit 1
     fi
 }
@@ -43,10 +43,10 @@ create_ssl_keys() {
 
     # check if certificate and key files already exist
     if [[ -f "$cert_file" && -f "$key_file" ]]; then
-        echo "SSL certificate and key already exist. Skipping generation."
-        echo "Certificate: $cert_file"
-        echo "Private Key: $key_file"
-        echo "Permissions:"
+        echo "[+] SSL certificate and key already exist. Skipping generation."
+        echo "[+] Certificate: $cert_file"
+        echo "[+] Private Key: $key_file"
+        echo "[+] Permissions:"
         ls -l "$cert_file" "$key_file"
         return
     fi
@@ -59,20 +59,20 @@ create_ssl_keys() {
 
     openssl req -new -x509 -key "$key_file" -out "$cert_file" -days 90 <<EOF
 US
-Some State
-Some City
-Some Organization
-Some Unit
+Ohio
+Stow
+Organization
+Unit
 example.com
 admin@example.com
 EOF
 
     chmod 644 "$cert_file"
 
-    echo "SSL certificate and key generated successfully!"
-    echo "Certificate: $cert_file"
-    echo "Private Key: $key_file"
-    echo "Permissions:"
+    echo "[+] SSL certificate and key generated successfully!"
+    echo "[+] Certificate: $cert_file"
+    echo "[+] Private Key: $key_file"
+    echo "[+] Permissions:"
     ls -l "$cert_file" "$key_file"
 }
 
@@ -134,10 +134,33 @@ install() {
         exit 1
     fi
 
+    # Upgrade pip to the latest version
+    echo "[+] Upgrading pip..."
+    python3 -m pip install --upgrade pip || {
+        echo "[-] Failed to upgrade pip. Continuing with the existing version..."
+    }
+
     # Install dependencies
     echo "[+] Installing dependencies..."
-    pip install -r requirements.txt
+    while read -r package; do
+        echo "[+] Installing $package..."
+        pip install "$package" || {
+            echo "[!] Failed to install $package via pip. Retrying with --break-system-packages..."
+            pip install "$package" --break-system-packages || {
+                echo "[!] Failed to install $package with --break-system-packages. Trying apt..."
+                apt_package="python3-$(echo "$package" | sed 's/[=<>].*//g' | tr '-' '_')"
+                if apt show "$apt_package" &>/dev/null; then
+                    sudo apt install -y "$apt_package" || {
+                        echo "[-] Failed to install $package via both pip and apt. Skipping..."
+                    }
+                else
+                    echo "[-] $apt_package not available in apt. Skipping..."
+                fi
+            }
+        }
+    done < requirements.txt
 }
+
 
 main() {
     root                # ensure the script is run as root
